@@ -1,0 +1,171 @@
+# Copyright 2026 ALTESSA SOLUTIONS INC.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macos / ${{ matrix.backend }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [apple, cairo]
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: ${{ matrix.backend == 'cairo' && '-tags=snrender_cairo' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version: stable
+          # The root module has no dependencies and so no go.sum; the nested
+          # module's is the only one there is to key the cache on.
+          cache-dependency-path: internal/coexist/go.sum
+
+      - name: Install Cairo and PDFium
+        if: matrix.backend == 'cairo'
+        run: |
+          brew install cairo freetype gdk-pixbuf pkgconf
+          arch=arm64
+          if [ "$(uname -m)" = x86_64 ]
+          then
+            arch=x64
+          fi
+          python3 internal/clib/snrender/scripts/fetch-pdfium.py --platform "mac-$arch" --output "$RUNNER_TEMP/pdfium"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/pdfium/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/pdfium/lib -Wl,-rpath,$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -short -count=1 ./...
+
+      - name: Link beside snnote-go
+        run: go -C internal/coexist test -mod=readonly -count=1 ./...
+
+  linux:
+    name: linux / cairo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: debian:trixie
+    env:
+      CGO_ENABLED: "1"
+      CC: clang
+    steps:
+      - name: Install the compiler and the Cairo stack
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates git clang pkg-config python3 libcairo2-dev libfreetype-dev \
+              libgdk-pixbuf-2.0-dev zlib1g-dev libsqlite3-dev libpango1.0-dev libharfbuzz-dev \
+              libfontconfig1-dev
+          clang --version | head -1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version: stable
+          # The root module has no dependencies and so no go.sum; the nested
+          # module's is the only one there is to key the cache on.
+          cache-dependency-path: internal/coexist/go.sum
+
+      - name: Fetch PDFium
+        run: |
+          python3 internal/clib/snrender/scripts/fetch-pdfium.py --platform linux-x64 --output "$RUNNER_TEMP/pdfium"
+          echo "CGO_CFLAGS=-I$RUNNER_TEMP/pdfium/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/pdfium/lib -Wl,-rpath,$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Test with full cgo pointer checks
+        run: GOEXPERIMENT=cgocheck2 go test -count=1 ./...
+
+      - name: Fuzz page drawing briefly
+        run: go test -run='^$' -fuzz=FuzzRender -fuzztime=30s .
+
+      - name: Link beside snnote-go
+        run: go -C internal/coexist test -mod=readonly -count=1 ./...
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.15
+      # The action above lints the root module, which on Linux is the Cairo
+      # build; the nested module, with its sibling bindings, is linted separately.
+      - name: Lint the coexistence module
+        working-directory: internal/coexist
+        run: golangci-lint run ./...
+
+  windows:
+    timeout-minutes: 25
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CGO_ENABLED: "1"
+      CC: gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version: stable
+          # The root module has no dependencies and so no go.sum; the nested
+          # module's is the only one there is to key the cache on.
+          cache-dependency-path: internal/coexist/go.sum
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-gdk-pixbuf2
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-pango
+            mingw-w64-ucrt-x86_64-fontconfig
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-python
+      - name: Fetch PDFium
+        run: |
+          pdfium="$(cygpath -m "$RUNNER_TEMP")/pdfium"
+          python internal/clib/snrender/scripts/fetch-pdfium.py --platform win-x64 --output "$pdfium"
+          echo "CGO_CFLAGS=-I$pdfium/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L$pdfium/lib" >> "$GITHUB_ENV"
+          echo "PDFIUM_BIN=$(cygpath -u "$pdfium")/bin" >> "$GITHUB_ENV"
+      - name: Vet
+        run: |
+          export PATH="$PDFIUM_BIN:$PATH"
+          go vet ./...
+      - name: Test
+        run: |
+          export PATH="$PDFIUM_BIN:$PATH"
+          go test -short -count=1 ./...
+      - name: Link beside snnote-go
+        run: |
+          export PATH="$PDFIUM_BIN:$PATH"
+          go -C internal/coexist test -mod=readonly -count=1 ./...
